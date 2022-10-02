@@ -1,0 +1,28 @@
+[package]
+name = "teamspeak-updater"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.65"
+argh = "0.1.9"
+futures = "0.3.24"
+reqwest = { version = "0.11.12", features = ["rustls-tls", "trust-dns", "stream"] }
+scraper = "0.13.0"
+semver = "1.0.14"
+tempfile = "3.3.0"
+thiserror = "1.0.37"
+tokio = { version = "1.21.2", features = ["full"] }
+tokio-util = { version = "0.7.4", features = ["compat"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+zip = "0.6.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+zip = "0.6.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+bzip2 = "0.4"
+tar = "0.4"
