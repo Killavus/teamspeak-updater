@@ -2,6 +2,8 @@
 
 This little piece of utility software automates the busy-work related to updating the TeamSpeak server binaries. TeamSpeak has this peculiar behavior of connecting periodically to mothership and shutting down your server the moment an update is available. Every time it happens on my server I have to perform manual downloading & extracting new binaries and restarting the related daemon runner. This tool automates the first two parts of the process.
 
+This utility is easily replaceable by a simple bash script. I've used Rust because I like it 😛.
+
 ## Usage
 
 For all configuration options, see `--help`.
