@@ -1,6 +1,6 @@
 # TeamSpeak Server Updater
 
-![./cli.png]
+![TeamSpeak Updater in action - example run & usage](./cli.png)
 
 This little piece of utility software automates the busy-work related to updating the TeamSpeak server binaries. TeamSpeak has this peculiar behavior of connecting periodically to mothership and shutting down your server the moment an update is available. Every time it happens on my server I have to perform manual downloading & extracting new binaries and restarting the related daemon runner. This tool automates the first two parts of the process.
 
