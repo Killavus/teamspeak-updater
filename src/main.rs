@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, process::exit};
 
 use anyhow::Result;
 use argh::FromArgs;
@@ -23,7 +23,7 @@ mod target {
         NotRecognized(String),
     }
 
-    enum ArchiveType {
+    pub enum ArchiveType {
         Bzip2Tarball,
         Zip,
     }
@@ -82,7 +82,7 @@ mod target {
             )
         }
 
-        fn archive_type(&self) -> ArchiveType {
+        pub fn archive_type(&self) -> ArchiveType {
             match &self {
                 Self::Mac | Self::WindowsX86 | Self::WindowsX8664 => ArchiveType::Zip,
                 _ => ArchiveType::Bzip2Tarball,
@@ -128,7 +128,7 @@ pub struct Config {
     #[argh(option, default = "PathBuf::from(\"/opt/teamspeak\")")]
     symlink_path: PathBuf,
     /// path to releases directory where all downloaded TeamSpeak versions will be stored.
-    #[argh(option, default = "PathBuf::from(\"/opt/teamspeak-releases\")")]
+    #[argh(option, default = "PathBuf::from(\"/opt/teamspeak-releases/\")")]
     releases_path: PathBuf,
     /// operating system / architecture tuple used to recognize which TeamSpeak version should be installed.
     #[argh(option, default = "target::Tuple::deduce()")]
@@ -141,10 +141,85 @@ pub struct Config {
     mirror_url: String,
 }
 
-mod teamspeak_local {
-    use crate::Config;
+mod extractor {
+    use crate::target::{self, ArchiveType};
     use anyhow::Result;
+    use std::{
+        io::{Seek, SeekFrom},
+        sync::Arc,
+    };
+
+    pub async fn extract(
+        archive_type: &target::ArchiveType,
+        tempdir: Arc<tempfile::TempDir>,
+        server_archive: tokio::fs::File,
+    ) -> Result<()> {
+        match archive_type {
+            ArchiveType::Zip => extract_zip(tempdir, server_archive).await?,
+            ArchiveType::Bzip2Tarball => extract_tarball(tempdir, server_archive).await?,
+        };
+
+        Ok(())
+    }
+
+    async fn extract_zip(
+        tempdir: Arc<tempfile::TempDir>,
+        server_archive: tokio::fs::File,
+    ) -> Result<()> {
+        use std::io::BufReader;
+        use zip::ZipArchive;
+        let mut server_archive = BufReader::new(server_archive.into_std().await);
+        let tempdir_ = tempdir.clone();
+
+        tokio::task::spawn_blocking::<_, Result<()>>(move || {
+            server_archive.seek(SeekFrom::Start(0))?;
+            let mut archive = ZipArchive::new(server_archive)?;
+            archive.extract(tempdir_.path())?;
+
+            Ok(())
+        })
+        .await??;
+
+        Ok(())
+    }
+
+    async fn extract_tarball(
+        tempdir: Arc<tempfile::TempDir>,
+        server_archive: tokio::fs::File,
+    ) -> Result<()> {
+        use bzip2::bufread::BzDecoder;
+        use std::io::BufReader;
+
+        let mut server_archive = BufReader::new(server_archive.into_std().await);
+        let tempdir_ = tempdir.clone();
+
+        tokio::task::spawn_blocking::<_, Result<()>>(move || {
+            use std::io::prelude::*;
+            use tar::Archive;
+            server_archive.seek(std::io::SeekFrom::Start(0))?;
+
+            let mut decoder = BzDecoder::new(server_archive);
+            let mut tarball_buf = vec![];
+
+            decoder.read_to_end(&mut tarball_buf)?;
+
+            let mut tarball = Archive::new(tarball_buf.as_slice());
+            tarball.unpack(tempdir_.path())?;
+
+            Ok(())
+        })
+        .await??;
+
+        Ok(())
+    }
+}
+
+mod teamspeak_local {
+    use crate::{extractor, Config};
+    use anyhow::Result;
+    use futures::stream::FuturesUnordered;
     use semver::Version;
+    use std::{io::Error, path::PathBuf, sync::Arc};
 
     pub async fn installed_version(config: &Config) -> Result<Version> {
         let Config { symlink_path, .. } = config;
@@ -177,6 +252,140 @@ mod teamspeak_local {
         config: &Config,
         published_version: &semver::Version,
     ) -> Result<()> {
+        let tempdir = Arc::new(tempfile::tempdir()?);
+        let archive_type = config.target_tuple.archive_type();
+
+        print!("📦 Extracting the archive... ");
+        extractor::extract(&archive_type, tempdir.clone(), server_archive).await?;
+        println!("✅");
+
+        print!("📦 Moving files to new release...");
+        move_extracted_files(tempdir, config, published_version).await?;
+        println!("✅");
+
+        Ok(())
+    }
+
+    async fn move_extracted_files(
+        tempdir: Arc<tempfile::TempDir>,
+        config: &Config,
+        published_version: &semver::Version,
+    ) -> Result<()> {
+        use futures::prelude::*;
+        use tokio::fs;
+
+        let Config { releases_path, .. } = config;
+
+        let mut version_path = PathBuf::from(releases_path).canonicalize()?;
+        version_path.push(published_version.to_string());
+
+        let mut read_dir = fs::read_dir(tempdir.path()).await?;
+
+        // Since TeamSpeak archives are always getting the main folder, we need traverse it instead.
+        if let Ok(Some(entry)) = read_dir.next_entry().await {
+            read_dir = fs::read_dir(entry.path()).await?;
+        }
+
+        let mut read_queue = vec![(version_path.clone(), read_dir)];
+        let mut file_paths = vec![];
+
+        let ignore_exists_error = |e: Error| {
+            use std::io::ErrorKind;
+            if e.kind() == ErrorKind::AlreadyExists {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        };
+
+        fs::create_dir(&version_path)
+            .await
+            .or_else(ignore_exists_error)?;
+
+        let version_path = version_path.canonicalize()?;
+
+        while let Some((root_path, mut read_dir)) = read_queue.pop() {
+            let mut append_dirs = vec![];
+            while let Ok(Some(entry)) = read_dir.next_entry().await {
+                let metadata = entry.metadata().await?;
+
+                if metadata.is_dir() {
+                    let dir_path = {
+                        let mut path = root_path.canonicalize()?;
+                        path.push(entry.file_name());
+                        path
+                    };
+                    fs::create_dir(&dir_path)
+                        .await
+                        .or_else(ignore_exists_error)?;
+                    append_dirs.push((dir_path, fs::read_dir(entry.path()).await?));
+                }
+
+                if metadata.is_file() {
+                    file_paths.push(entry.path());
+                }
+            }
+
+            read_queue.extend(append_dirs.into_iter());
+        }
+
+        let mut file_copying = Box::pin(
+            file_paths
+                .into_iter()
+                .map(|path| {
+                    let relative = path
+                        .strip_prefix(tempdir.path())
+                        .map(|relative| relative.iter().skip(1).collect::<PathBuf>());
+
+                    relative
+                        .map(|relative| version_path.join(relative))
+                        .map(|to| fs::copy(path.clone(), to))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .collect::<FuturesUnordered<_>>(),
+        );
+
+        future::try_join_all(file_copying.as_mut().iter_pin_mut()).await?;
+
+        Ok(())
+    }
+
+    pub async fn swap_link(config: &Config, published_version: &semver::Version) -> Result<()> {
+        let Config {
+            releases_path,
+            symlink_path,
+            ..
+        } = config;
+
+        use tokio::fs;
+
+        let symlink_file_name = symlink_path
+            .file_name()
+            .expect("symlink should expose filename")
+            .to_str()
+            .expect("symlink filename is valid utf-8");
+
+        let mut new_path = symlink_path.clone();
+        let unix_timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        new_path.set_file_name(format!("{}.{}", symlink_file_name, unix_timestamp));
+
+        let new_symlink_src = {
+            let mut path = releases_path.clone().canonicalize()?;
+            path.push(published_version.to_string());
+            path
+        };
+
+        println!(
+            "🧠 Swapping symbolic links (old saved to {})",
+            &new_path.as_os_str().to_string_lossy()
+        );
+        fs::rename(symlink_path, new_path).await?;
+        fs::symlink_dir(new_symlink_src, symlink_path).await?;
+
         Ok(())
     }
 }
@@ -241,9 +450,8 @@ mod teamspeak_remote {
         let archive_url = remote_archive_path(config, target);
         print!("🌐 Downloading {}... ", archive_url);
         let archive_response = http.get(archive_url).send().await?.error_for_status()?;
-
-        let mut tempfile =
-            tokio::io::BufWriter::new(tokio::fs::File::from_std(tempfile::tempfile()?));
+        let tempfile = tempfile::tempfile()?;
+        let mut tempfile = tokio::io::BufWriter::new(tokio::fs::File::from_std(tempfile));
 
         let mut stream = tokio::io::BufReader::new(
             archive_response
@@ -291,6 +499,7 @@ fn print_config_summary(config: &Config) {
         "Mirror URL used to check for TeamSpeak versions: {}",
         config.mirror_url
     );
+    println!("Package target tuple: {}", config.target_tuple,);
     println!();
 }
 
@@ -336,6 +545,13 @@ async fn main() -> Result<()> {
         let server_archive =
             teamspeak_remote::download_release(&config, &http, &published_version).await?;
         teamspeak_local::extract_archive(server_archive, &config, &published_version).await?;
+        teamspeak_local::swap_link(&config, &published_version).await?;
+
+        println!();
+        println!("✅ TeamSpeak successfully updated! ✅");
+    } else {
+        println!("✅ You are running the newest version of TeamSpeak.");
+        exit(1);
     }
 
     Ok(())
