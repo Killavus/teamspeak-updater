@@ -1,5 +1,7 @@
 # TeamSpeak Server Updater
 
+![./cli.png]
+
 This little piece of utility software automates the busy-work related to updating the TeamSpeak server binaries. TeamSpeak has this peculiar behavior of connecting periodically to mothership and shutting down your server the moment an update is available. Every time it happens on my server I have to perform manual downloading & extracting new binaries and restarting the related daemon runner. This tool automates the first two parts of the process.
 
 This utility is easily replaceable by a simple bash script. I've used Rust because I like it 😛.
@@ -18,6 +20,8 @@ This tool works in an opinionated way to perform its task. You need to setup you
 
 You need to configure your environment so the user running this program has all required accesses. On Windows, remember that creating symlinks by default requires administrator priviledges. If target release directory exists, all files within will get overwritten. Tool does not run if it does not detect that current local version is lower than latest published version, so in this case nothing will get overwritten.
 
+This tool returns non-zero exit code when no action is peformed or error has occured. You can use this fact to check for `0` exit code in a bigger script to know TeamSpeak got updated.
+
 ## Installation
 
 You need to have [Rust toolchain](https://rustup.rs/) installed.
@@ -35,3 +39,4 @@ Pre-built binaries _may_ be supplied in the future.
 ## License
 
 [Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0)
+.
